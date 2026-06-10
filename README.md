@@ -140,7 +140,11 @@ pip install -r requirements.txt   # requirements.txt also references the engine 
 python -m uvicorn main:app --reload
 ```
 
-Server runs on `http://localhost:8000`. WebSocket at `ws://localhost:8000/ws/{room_id}/{player_id}`.
+Server runs on `http://localhost:8000`:
+- REST endpoints: `POST /rooms`, `GET /rooms/{room_id}`, `GET /health`
+- WebSocket: `ws://localhost:8000/ws/{room_id}/{player_id}`
+
+The server is now ready to accept WebSocket connections from a browser UI or AI agents.
 
 ### Test
 
@@ -183,5 +187,5 @@ See CLAUDE.md for details on remaining future enhancements (auto-start, observer
 ## Related
 
 - **shengji-engine** — Pure Python game engine (sibling repo)
-- **shengji-web** — Browser UI (future)
+- **shengji-app** — Browser UI and client (future work)
 - **shengji-ai** — AI agents (future)
