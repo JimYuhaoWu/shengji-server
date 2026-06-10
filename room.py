@@ -17,11 +17,14 @@ from serializer import serialize_for_player
 class Room:
     """A single game room."""
 
+    RECONNECT_GRACE_PERIOD = 300  # 5 minutes to reconnect before losing your seat
+
     def __init__(self, room_id: str, dealer_id: int = 0):
         self.room_id = room_id
         self.game = Game(num_players=6)
         self.state: GameState = self.game.reset(dealer_id=dealer_id)
         self.connections: dict[int, WebSocket] = {}  # player_id -> WebSocket
+        self.disconnected_at: dict[int, datetime] = {}  # player_id -> disconnect time
         self.created_at = datetime.now()
         self.last_activity = datetime.now()
 
@@ -41,8 +44,26 @@ class Room:
         self.last_activity = datetime.now()
 
     def remove_connection(self, player_id: int) -> None:
-        """Drop a player's connection (no-op if absent)."""
+        """Mark a player as temporarily disconnected (keep the seat for grace period)."""
         self.connections.pop(player_id, None)
+        self.disconnected_at[player_id] = datetime.now()
+        self.last_activity = datetime.now()
+
+    def is_reconnecting(self, player_id: int) -> bool:
+        """True if the player disconnected recently and is reconnecting within grace period."""
+        if player_id not in self.disconnected_at:
+            return False
+        elapsed = (datetime.now() - self.disconnected_at[player_id]).total_seconds()
+        if elapsed > self.RECONNECT_GRACE_PERIOD:
+            # Grace period expired; free the seat.
+            del self.disconnected_at[player_id]
+            return False
+        return True
+
+    def restore_connection(self, player_id: int, websocket: WebSocket) -> None:
+        """Restore a reconnecting player's connection."""
+        self.connections[player_id] = websocket
+        self.disconnected_at.pop(player_id, None)
         self.last_activity = datetime.now()
 
     def has_player(self, player_id: int) -> bool:

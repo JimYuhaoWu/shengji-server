@@ -5,18 +5,60 @@ rooms, relays actions into the engine via game_loop, and broadcasts state. It
 enforces no rules of its own.
 """
 
+import asyncio
 import json
 import uuid
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 
 from room import Room
-from game_loop import handle_action, handle_join, is_action_message
-
-app = FastAPI(title="shengji-server")
+from game_loop import handle_action, handle_join, handle_next_game, is_action_message
 
 # In-memory room storage — acceptable for local play (CLAUDE.md).
 rooms: dict[str, Room] = {}
+
+# Stale room cleanup configuration
+SWEEPER_INTERVAL = 600  # 10 minutes
+STALE_ROOM_MAX_AGE = 3600  # 1 hour
+
+sweeper_task: asyncio.Task | None = None
+
+
+async def sweeper_loop():
+    """Periodically clean up stale rooms (no activity for max_age_seconds)."""
+    while True:
+        try:
+            await asyncio.sleep(SWEEPER_INTERVAL)
+            # Find and remove stale rooms.
+            stale_ids = [
+                rid for rid, room in rooms.items()
+                if room.is_stale(max_age_seconds=STALE_ROOM_MAX_AGE)
+            ]
+            for rid in stale_ids:
+                del rooms[rid]
+        except Exception:
+            # Continue sweeping even if an iteration fails.
+            pass
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown lifecycle for the FastAPI app."""
+    # Startup: start the sweeper loop.
+    global sweeper_task
+    sweeper_task = asyncio.create_task(sweeper_loop())
+    yield
+    # Shutdown: cancel the sweeper.
+    if sweeper_task:
+        sweeper_task.cancel()
+        try:
+            await sweeper_task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="shengji-server", lifespan=lifespan)
 
 
 def _new_room_id() -> str:
@@ -57,6 +99,10 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, player_id: int)
 
     Accepts the socket, registers the player, sends current state, then relays
     action messages to the game loop until the player disconnects.
+
+    Supports reconnect/resume: if the player was disconnected within the grace
+    period (RECONNECT_GRACE_PERIOD), they rejoin their existing seat; otherwise
+    it's a fresh join.
     """
     room = rooms.get(room_id)
     if room is None:
@@ -65,12 +111,20 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, player_id: int)
     if not (0 <= player_id <= 5):
         await websocket.close(code=4003, reason="Invalid player_id (0-5)")
         return
+
+    # Check if this is a reconnect or a fresh join.
+    is_reconnect = room.is_reconnecting(player_id)
     if room.has_player(player_id):
+        # Seat is occupied by an active connection; reject.
         await websocket.close(code=4002, reason="Player already connected")
         return
 
     await websocket.accept()
-    room.add_connection(player_id, websocket)
+
+    if is_reconnect:
+        room.restore_connection(player_id, websocket)
+    else:
+        room.add_connection(player_id, websocket)
 
     # Confirm join, then send the player their current view.
     await websocket.send_json({
@@ -103,6 +157,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, player_id: int)
 
             if is_action_message(message):
                 await handle_action(room, player_id, message)
+            elif message.get("type") == "next_game":
+                await handle_next_game(room, player_id)
             # Unknown / non-action message types are ignored silently (CLAUDE.md).
 
     except WebSocketDisconnect:

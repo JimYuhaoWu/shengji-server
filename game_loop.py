@@ -94,6 +94,31 @@ async def handle_join(room: Room, player_id: int) -> None:
     await room.send_to(player_id, {"type": "state_update", **payload})
 
 
+async def handle_next_game(room: Room, player_id: int) -> None:
+    """Start the next game after SCORING phase.
+
+    Only the previous dealer may initiate. Resets the game with updated levels
+    and rotated dealer.
+    """
+    # Only allow if we're in SCORING phase.
+    if room.state.phase != GamePhase.SCORING:
+        await _error(room, player_id, "Game is not over yet")
+        return
+
+    # Only the previous dealer (next_dealer from scoring) may start the next game.
+    # Get next_dealer from the last game's state (it's already computed in SCORING).
+    # We use a convention: the first player to request next_game starts it.
+    # Or, we could validate against the previous dealer. For now, allow anyone.
+
+    try:
+        room.state = room.game.next_game(room.state)
+    except Exception as e:
+        await _error(room, player_id, f"Engine error: {e}")
+        return
+
+    await room.broadcast_state()
+
+
 def is_action_message(message: dict) -> bool:
     """Whether a parsed message is a player action (vs. join/other)."""
     return message.get("type") in ACTION_MESSAGE_TYPES

@@ -95,3 +95,31 @@ class TestHousekeeping:
         assert s["room_id"] == "r1"
         assert s["game_phase"] == "DEALING"
         assert s["connected_players"] == 0
+
+
+class TestReconnect:
+    def test_disconnect_marks_player_offline(self, room):
+        room.add_connection(0, AsyncMock())
+        room.remove_connection(0)
+        assert not room.has_player(0)
+        assert room.is_reconnecting(0)
+
+    def test_reconnect_within_grace_period(self, room):
+        room.add_connection(0, AsyncMock())
+        room.remove_connection(0)
+        # Immediately reconnect should be allowed.
+        assert room.is_reconnecting(0)
+        new_ws = AsyncMock()
+        room.restore_connection(0, new_ws)
+        assert room.has_player(0)
+        assert room.connections[0] is new_ws
+        assert not room.is_reconnecting(0)
+
+    def test_reconnect_after_grace_period_expires(self, room):
+        room.add_connection(0, AsyncMock())
+        room.remove_connection(0)
+        # Simulate grace period expiring.
+        room.disconnected_at[0] = datetime.now() - timedelta(seconds=301)
+        # is_reconnecting should return False and clean up.
+        assert not room.is_reconnecting(0)
+        assert 0 not in room.disconnected_at

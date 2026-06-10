@@ -7,7 +7,7 @@ import pytest
 from shengji import GamePhase
 
 from room import Room
-from game_loop import handle_action, handle_join, is_action_message
+from game_loop import handle_action, handle_join, handle_next_game, is_action_message
 
 
 def make_room_with_players():
@@ -107,3 +107,38 @@ class TestFullPlaythrough:
         go = last_message(socks[0])
         assert "farmer_score" in go
         assert "next_dealer" in go
+
+
+@pytest.mark.asyncio
+class TestNextGame:
+    async def test_next_game_only_after_scoring(self):
+        room, socks = make_room_with_players()
+        # Try to start next game during DEALING (should fail).
+        await handle_next_game(room, 0)
+        msg = last_message(socks[0])
+        assert msg["type"] == "error"
+        assert "not over" in msg["message"].lower()
+
+    async def test_next_game_resets_and_broadcasts(self):
+        room, socks = make_room_with_players()
+
+        # Play to SCORING.
+        steps = 0
+        while room.state.phase != GamePhase.SCORING and steps < 5000:
+            cur = room.state.current_player
+            await handle_action(room, cur, {"type": "action", "index": 0})
+            steps += 1
+
+        assert room.state.phase == GamePhase.SCORING
+
+        # Start next game.
+        await handle_next_game(room, 0)
+
+        # Should be back to DEALING.
+        assert room.state.phase == GamePhase.DEALING
+        # Levels should be preserved.
+        assert room.state.player_levels is not None
+        # Every player received a state_update.
+        for pid in range(6):
+            msg = last_message(socks[pid])
+            assert msg["type"] == "state_update"

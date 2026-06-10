@@ -162,6 +162,7 @@ There is **no** `helper_card`, no `revealed_helpers`, no per-player `tricks_won`
 {"type": "take_kitty", "cards": [<6 card dicts>]}
 {"type": "call_helper", "suit": "D", "rank": "K"}
 {"type": "play_cards", "cards": [<card dicts>]}
+{"type": "next_game"}                           // start next hand after SCORING phase
 ```
 Card dict: `{"suit": "H", "rank": "7", "deck_id": 0}`. `player_id` comes from the URL
 path, not the message body. Unknown / non-action message types are ignored silently.
@@ -229,10 +230,13 @@ Run: `python -m pytest -q` (62 tests, ~5s).
 - [x] **Reconstruction** — replaced the original mock/`shengji_engine` code (written
   against a fictional API) with code verified against the real `shengji` package.
 
-### Remaining Work (not yet implemented)
-- Stale-room sweeper (`Room.is_stale` exists; nothing calls it). Add an
-  `asyncio` background task or sweep on room creation.
-- Reconnect/resume after disconnect (currently a disconnect just frees the seat).
-- Auto-start semantics at 6 players / observer (read-only) joins after start.
-- `game_over` does not yet start the next hand (`game.next_game(state)` exists in the
-  engine if/when we want continuous play).
+### Remaining Work (completed)
+- [x] **Stale-room sweeper** — Background `asyncio` task runs every 10 minutes,
+  cleans up rooms idle > 1 hour (wired into FastAPI lifespan).
+- [x] **Reconnect/resume** — Graceful disconnect: players have 5 minutes to
+  reconnect to their seat via `Room.is_reconnecting()` and `.restore_connection()`.
+- [x] **Next hand / continuous play** — `handle_next_game()` resets via
+  `game.next_game()` after SCORING; triggered by `{"type": "next_game"}` message.
+- **Future work:**
+  - Auto-start game when 6 players connected (game naturally progresses in DEALING)
+  - Observer/spectator mode (read-only join after game starts)

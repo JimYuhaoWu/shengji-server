@@ -74,6 +74,7 @@ ten = `"T"`, jokers = `"Js"`/`"Jl"`).
 {"type": "take_kitty", "cards": [ /* exactly 6 card dicts */ ]}
 {"type": "call_helper", "suit": "D", "rank": "K"}
 {"type": "play_cards", "cards": [{"suit": "H", "rank": "7", "deck_id": 0}]}
+{"type": "next_game"}
 ```
 The current player may either pick a precomputed legal action by `index` (the server
 sends `legal_actions` to that player) or send the equivalent semantic message. The
@@ -144,7 +145,7 @@ Server runs on `http://localhost:8000`. WebSocket at `ws://localhost:8000/ws/{ro
 ### Test
 
 ```bash
-python -m pytest -q     # 62 tests (run against the real engine, ~5s)
+python -m pytest -q     # 67 tests (run against the real engine, ~6s)
 ```
 
 ## Project Structure
@@ -169,18 +170,15 @@ python -m pytest -q     # 62 tests (run against the real engine, ~5s)
 
 ## Status
 
-All six build steps are complete and the suite passes (62 tests) against the **real**
-`shengji` engine — including a full game played to the `SCORING` phase through the
-WebSocket action loop.
+All core features are complete and the suite passes (67 tests) against the **real**
+`shengji` engine:
 
-> **Note:** an earlier draft of this server was written against a fictional
-> `shengji_engine` API using mocks. It has been fully reconstructed against the real
-> `shengji` package (correct package name, `Action`/`ActionType`/`GameState` shapes,
-> single-char card encodings, and the KITTY legal-action explosion).
+- [x] Reconstruction: real engine, correct API
+- [x] Stale-room sweeper: background cleanup every 10 minutes
+- [x] Reconnect/resume: 5-minute grace period for reconnecting players
+- [x] Next-hand support: `game.next_game()` wired to `{"type": "next_game"}` message
 
-**Remaining work:** stale-room sweeper (hook up `Room.is_stale`), reconnect/resume,
-auto-start + observer joins, and starting the next hand after `game_over`
-(`game.next_game(state)`). See CLAUDE.md → Remaining Work.
+See CLAUDE.md for details on remaining future enhancements (auto-start, observer mode).
 
 ## Related
 
