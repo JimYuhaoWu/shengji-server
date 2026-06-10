@@ -1,154 +1,103 @@
-"""Serialize game state with privacy controls for WebSocket clients."""
+"""Serialize the engine's GameState for a specific player, enforcing privacy.
 
-from typing import TYPE_CHECKING
+Privacy rules (see CLAUDE.md):
+- A player sees only their own hand; everyone else sees just hand sizes.
+- Only the current player receives the list of legal actions.
+- The kitty is visible only to the dealer, and only while it exists.
+- Buried cards stay hidden until SCORING.
+- The called helper card is public (the dealer announces it); the identities of
+  revealed helpers come straight from the engine's helper_players, which is only
+  populated once a player has played the called card.
+"""
 
-from protocol import CardMessage, ActionMessage
+from shengji import GameState
+from protocol import card_to_dict, action_to_dict
 
-if TYPE_CHECKING:
-    from shengji_engine import GameState, Card, Action
-
-
-def card_to_message(card: "Card") -> CardMessage:
-    """Convert engine Card to protocol CardMessage.
-
-    Args:
-        card: Card from shengji-engine
-
-    Returns:
-        CardMessage for JSON serialization
-    """
-    return CardMessage(
-        suit=str(card.suit),
-        rank=str(card.rank),
-        deck_id=card.deck_id,
-    )
+# Cap on how many legal actions we serialize. The KITTY phase has C(32,6) ≈ 906k
+# bury actions — far too many to send. When exceeded we omit the list and the
+# client drives that phase with a semantic message (e.g. take_kitty) instead.
+MAX_LEGAL_ACTIONS = 500
 
 
-def action_to_message(action: "Action") -> ActionMessage:
-    """Convert engine Action to protocol ActionMessage.
-
-    Args:
-        action: Action from shengji-engine
-
-    Returns:
-        ActionMessage for JSON serialization
-    """
-    return ActionMessage(
-        action_type=str(action.action_type),
-        cards=[card_to_message(c) for c in action.cards],
-        target=action.target,
-    )
+def _trump_bid_to_dict(bid) -> dict | None:
+    if bid is None:
+        return None
+    return {"count": bid.count, "suit": bid.suit.value, "bidder_id": bid.bidder_id}
 
 
-def serialize_for_player(
-    state: "GameState",
-    viewing_player_id: int,
-) -> dict:
-    """Serialize game state for a specific player, filtering private information.
-
-    Privacy rules:
-    - Only the viewing player sees their own hand
-    - Only the current player sees legal actions
-    - No one sees other players' hands
-    - Hand sizes are visible to all (for game state tracking)
+def serialize_for_player(state: GameState, viewing_player_id: int) -> dict:
+    """Build the state_update payload for one player's perspective.
 
     Args:
-        state: GameState from shengji-engine
-        viewing_player_id: The player ID viewing this state (0-5)
+        state: the engine GameState
+        viewing_player_id: 0-5, the player this payload is for
 
     Returns:
-        Dictionary ready for JSON serialization to client
+        A JSON-serializable dict (without the "type" envelope field).
     """
     if not (0 <= viewing_player_id <= 5):
         raise ValueError(f"Invalid viewing_player_id: {viewing_player_id}")
 
-    # Build player-specific hand (only for viewing player)
-    your_hand = []
-    if state.hands is not None:
-        your_hand = [
-            card_to_message(c)
-            for c in state.hands[viewing_player_id]
-        ]
+    is_current = state.current_player == viewing_player_id
+    is_dealer = state.dealer_id == viewing_player_id
 
-    # Build hands_size for all players (visible to all)
-    hands_size = []
-    if state.hands is not None:
-        hands_size = [len(h) for h in state.hands]
+    # Own hand only; sizes for everyone.
+    your_hand = [card_to_dict(c) for c in state.hands[viewing_player_id]]
+    hands_size = [len(h) for h in state.hands]
 
-    # Legal actions only for current player
-    legal_actions = []
-    if state.current_player == viewing_player_id and state.legal_actions is not None:
-        legal_actions = [
-            action_to_message(a)
-            for a in state.legal_actions
-        ]
+    # Legal actions: current player only, and only when the list is sendable.
+    legal_actions = None
+    legal_actions_truncated = False
+    if is_current:
+        if len(state.legal_actions) <= MAX_LEGAL_ACTIONS:
+            legal_actions = [
+                action_to_dict(a, i) for i, a in enumerate(state.legal_actions)
+            ]
+        else:
+            legal_actions_truncated = True
 
-    # Current trick (cards played this round)
-    current_trick = []
-    if state.current_trick is not None:
-        for player_id, cards in state.current_trick:
-            current_trick.append([
-                player_id,
-                [card_to_message(c) for c in cards],
-            ])
+    # Current trick: [[player_id, [cards]], ...]
+    current_trick = [
+        [pid, [card_to_dict(c) for c in cards]] for pid, cards in state.current_trick
+    ]
 
-    # Tricks won by each player (visible to all)
-    tricks_won = []
-    if state.tricks_won is not None:
-        tricks_won = [
-            [card_to_message(c) for c in trick_cards]
-            for trick_cards in state.tricks_won
-        ]
+    # Tricks won: [[winner_id, [cards]], ...] — public record of completed tricks.
+    tricks_won = [
+        [winner_id, [card_to_dict(c) for c in cards]]
+        for winner_id, cards in state.tricks_won
+    ]
 
-    # Kitty visible only to dealer
+    # Kitty: dealer-only, while it exists (KITTY phase before burying).
     kitty = None
-    if state.kitty is not None and state.dealer_id == viewing_player_id:
-        kitty = [card_to_message(c) for c in state.kitty]
+    if is_dealer and state.kitty:
+        kitty = [card_to_dict(c) for c in state.kitty]
 
-    # Helper card (the card dealer called for identifying helpers)
-    helper_card = None
-    if state.helper_card is not None:
-        helper_card = card_to_message(state.helper_card)
+    # Buried cards: revealed to all only at SCORING.
+    buried_cards = None
+    if state.phase.name == "SCORING" and state.buried_cards:
+        buried_cards = [card_to_dict(c) for c in state.buried_cards]
 
     return {
-        "phase": str(state.phase) if state.phase else None,
+        "phase": state.phase.name,
         "current_player": state.current_player,
         "dealer_id": state.dealer_id,
-        "your_hand": [c.model_dump() for c in your_hand],
+        "your_player_id": viewing_player_id,
+        "your_hand": your_hand,
         "hands_size": hands_size,
-        "legal_actions": [a.model_dump() for a in legal_actions],
-        "trump_suit": str(state.trump_suit) if state.trump_suit else None,
+        "legal_actions": legal_actions,
+        "legal_actions_truncated": legal_actions_truncated,
+        "trump_suit": state.trump_suit.value if state.trump_suit else None,
         "trump_level": state.trump_level,
-        "current_trick": [
-            [player_id, [c.model_dump() for c in cards]]
-            for player_id, cards in current_trick
-        ],
-        "tricks_won": [
-            [c.model_dump() for c in trick]
-            for trick in tricks_won
-        ],
-        "scores": list(state.scores) if state.scores else [],
-        "player_levels": list(state.player_levels) if state.player_levels else [],
-        "revealed_helpers": list(state.revealed_helpers) if state.revealed_helpers else [],
-        "kitty": [c.model_dump() for c in kitty] if kitty else None,
-        "helper_card": helper_card.model_dump() if helper_card else None,
-    }
-
-
-def serialize_for_all_players(
-    state: "GameState",
-) -> dict[int, dict]:
-    """Serialize game state for all 6 players.
-
-    Each player gets the state filtered for their perspective.
-
-    Args:
-        state: GameState from shengji-engine
-
-    Returns:
-        Dictionary mapping player_id -> serialized_state
-    """
-    return {
-        player_id: serialize_for_player(state, player_id)
-        for player_id in range(6)
+        "trump_locked": state.trump_locked,
+        "current_trump_bid": _trump_bid_to_dict(state.current_trump_bid),
+        "cards_dealt": state.cards_dealt,
+        "current_trick": current_trick,
+        "tricks_won": tricks_won,
+        "scores": list(state.scores),
+        "player_levels": list(state.player_levels),
+        "called_rank": state.called_rank,
+        "called_suit": state.called_suit.value if state.called_suit else None,
+        "helper_players": list(state.helper_players),
+        "kitty": kitty,
+        "buried_cards": buried_cards,
     }

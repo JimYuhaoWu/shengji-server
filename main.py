@@ -1,167 +1,120 @@
-"""FastAPI application with WebSocket and REST endpoints."""
+"""FastAPI application: REST room management + the game WebSocket.
+
+The server is a thin transport over the `shengji` engine (CLAUDE.md): it owns
+rooms, relays actions into the engine via game_loop, and broadcasts state. It
+enforces no rules of its own.
+"""
 
 import json
 import uuid
-from datetime import datetime
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from pydantic import BaseModel
+
+from room import Room
+from game_loop import handle_action, handle_join, is_action_message
 
 app = FastAPI(title="shengji-server")
 
-
-# ============ DATA MODELS ============
-
-
-class RoomStatus(BaseModel):
-    """Room status response."""
-    room_id: str
-    connected_players: int
-    game_phase: str | None
-    started: bool
-    created_at: str
+# In-memory room storage — acceptable for local play (CLAUDE.md).
+rooms: dict[str, Room] = {}
 
 
-class CreateRoomResponse(BaseModel):
-    """Response from room creation."""
-    room_id: str
+def _new_room_id() -> str:
+    return uuid.uuid4().hex[:8]
 
 
-# ============ IN-MEMORY STORAGE ============
-
-
-rooms: dict[str, dict] = {}
-
-
-def create_room_id() -> str:
-    """Generate a unique room ID."""
-    return str(uuid.uuid4())[:8]
-
-
-# ============ REST ENDPOINTS ============
+# ============ REST ============
 
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
     return {"status": "ok"}
 
 
 @app.post("/rooms")
-async def create_room() -> CreateRoomResponse:
-    """Create a new game room.
-
-    Returns:
-        CreateRoomResponse with the new room_id
-    """
-    room_id = create_room_id()
-    rooms[room_id] = {
-        "room_id": room_id,
-        "connections": {},  # player_id -> WebSocket
-        "created_at": datetime.now(),
-        "game_state": None,
-        "phase": None,
-    }
-    return CreateRoomResponse(room_id=room_id)
+async def create_room():
+    """Create a new game room and return its id."""
+    room_id = _new_room_id()
+    rooms[room_id] = Room(room_id)
+    return {"room_id": room_id}
 
 
 @app.get("/rooms/{room_id}")
-async def get_room_status(room_id: str) -> RoomStatus:
-    """Get status of a room.
-
-    Args:
-        room_id: The room ID
-
-    Returns:
-        RoomStatus with connected players and game phase
-
-    Raises:
-        HTTPException 404 if room not found
-    """
-    if room_id not in rooms:
+async def get_room(room_id: str):
+    """Return a room's status, or 404 if it doesn't exist."""
+    room = rooms.get(room_id)
+    if room is None:
         raise HTTPException(status_code=404, detail="Room not found")
-
-    room = rooms[room_id]
-    return RoomStatus(
-        room_id=room_id,
-        connected_players=len(room["connections"]),
-        game_phase=room["phase"],
-        started=room["phase"] is not None,
-        created_at=room["created_at"].isoformat(),
-    )
+    return room.status()
 
 
-# ============ WEBSOCKET ENDPOINT ============
+# ============ WEBSOCKET ============
 
 
 @app.websocket("/ws/{room_id}/{player_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str, player_id: int):
-    """WebSocket endpoint for game players.
+    """One player's connection to a room.
 
-    Args:
-        websocket: The WebSocket connection
-        room_id: The room ID to join
-        player_id: The player ID (0-5)
+    Accepts the socket, registers the player, sends current state, then relays
+    action messages to the game loop until the player disconnects.
     """
-    if room_id not in rooms:
+    room = rooms.get(room_id)
+    if room is None:
         await websocket.close(code=4004, reason="Room not found")
         return
-
     if not (0 <= player_id <= 5):
-        await websocket.close(code=4003, reason="Invalid player_id (must be 0-5)")
+        await websocket.close(code=4003, reason="Invalid player_id (0-5)")
         return
-
-    room = rooms[room_id]
-
-    if player_id in room["connections"]:
+    if room.has_player(player_id):
         await websocket.close(code=4002, reason="Player already connected")
         return
 
     await websocket.accept()
-    room["connections"][player_id] = websocket
+    room.add_connection(player_id, websocket)
+
+    # Confirm join, then send the player their current view.
+    await websocket.send_json({
+        "type": "joined",
+        "player_id": player_id,
+        "room_id": room_id,
+        "connected_players": room.connected_count(),
+    })
+    await handle_join(room, player_id)
+    await room.broadcast(
+        {
+            "type": "player_connected",
+            "player_id": player_id,
+            "connected_count": room.connected_count(),
+        },
+        exclude=player_id,
+    )
 
     try:
-        # Send initial state (placeholder)
-        await websocket.send_json({
-            "type": "joined",
-            "player_id": player_id,
-            "room_id": room_id,
-            "connected_players": len(room["connections"]),
-        })
-
-        # Listen for messages
         while True:
-            data = await websocket.receive_text()
-            message = json.loads(data)
-            # TODO: Handle messages when room.py is implemented
-            # For now, just echo back
-            await websocket.send_json({
-                "type": "error",
-                "message": "Game logic not yet implemented",
-            })
+            raw = await websocket.receive_text()
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError:
+                await websocket.send_json({"type": "error", "message": "Invalid JSON"})
+                continue
+            if not isinstance(message, dict) or "type" not in message:
+                await websocket.send_json({"type": "error", "message": "Malformed message"})
+                continue
+
+            if is_action_message(message):
+                await handle_action(room, player_id, message)
+            # Unknown / non-action message types are ignored silently (CLAUDE.md).
 
     except WebSocketDisconnect:
-        room["connections"].pop(player_id, None)
-
-        # Broadcast disconnection to other players
-        for ws in room["connections"].values():
-            try:
-                await ws.send_json({
-                    "type": "player_disconnected",
-                    "player_id": player_id,
-                    "connected_count": len(room["connections"]),
-                })
-            except:
-                pass
-
-        # Clean up stale rooms (no connections for 1 hour would happen elsewhere)
-
-    except json.JSONDecodeError:
-        await websocket.send_json({
-            "type": "error",
-            "message": "Invalid JSON",
+        room.remove_connection(player_id)
+        await room.broadcast({
+            "type": "player_disconnected",
+            "player_id": player_id,
+            "connected_count": room.connected_count(),
         })
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)

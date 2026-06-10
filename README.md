@@ -23,8 +23,8 @@ The server **does not enforce game rules**—all logic lives in `shengji-engine`
    - Connection/disconnection handling
 
 2. **Message Protocol** (`protocol.py`)
-   - Client messages: join, play_cards, declare_trump, call_helper
-   - Server messages: state updates, errors, game over
+   - Client actions: action (by index), pass_trump, bid_trump, take_kitty, call_helper, play_cards
+   - Server messages: joined, state updates, player connected/disconnected, errors, game over
    - JSON-based for browser client compatibility
 
 3. **Privacy & Serialization** (`serializer.py`)
@@ -62,19 +62,32 @@ Send current state
 
 ### WebSocket: `/ws/{room_id}/{player_id}`
 
+`player_id` (0–5) is taken from the URL path. Card dicts use single-character suit
+and rank values: `{"suit": "H", "rank": "7", "deck_id": 0}` (suits `H/D/C/S/J`,
+ten = `"T"`, jokers = `"Js"`/`"Jl"`).
+
 **Client messages:**
 ```json
-{"type": "join", "player_id": 0}
-{"type": "play_cards", "cards": [{"suit": "♥", "rank": "7", "deck_id": 0}]}
-{"type": "declare_trump", "level_cards": [...]}
-{"type": "call_helper", "card": {"suit": "♦", "rank": "K"}}
+{"type": "action", "index": 0}
+{"type": "pass_trump"}
+{"type": "bid_trump", "count": 1, "suit": "H"}
+{"type": "take_kitty", "cards": [ /* exactly 6 card dicts */ ]}
+{"type": "call_helper", "suit": "D", "rank": "K"}
+{"type": "play_cards", "cards": [{"suit": "H", "rank": "7", "deck_id": 0}]}
 ```
+The current player may either pick a precomputed legal action by `index` (the server
+sends `legal_actions` to that player) or send the equivalent semantic message. The
+KITTY phase has ~906k bury options, so `legal_actions` is omitted there
+(`legal_actions_truncated: true`) and you must use `take_kitty`.
 
 **Server messages:**
 ```json
-{"type": "state_update", "phase": "TRICK_PLAYING", "current_player": 2, "your_hand": [...], "legal_actions": [...]}
+{"type": "joined", "player_id": 0, "room_id": "abc123", "connected_players": 1}
+{"type": "state_update", "phase": "TRICK_PLAYING", "current_player": 2, "your_hand": [], "hands_size": [25,25,25,25,25,25], "legal_actions": []}
+{"type": "player_connected", "player_id": 1, "connected_count": 2}
+{"type": "player_disconnected", "player_id": 1, "connected_count": 1}
 {"type": "error", "message": "Not your turn"}
-{"type": "game_over", "winner_side": "farmer", "scores": {...}}
+{"type": "game_over", "farmer_score": 80, "next_dealer": 1, "player_levels": ["R1:2", "..."]}
 ```
 
 ### REST: `POST /rooms`
@@ -102,20 +115,22 @@ Query room status (useful for matchmaking).
 
 ## Key Principles
 
-See [CLAUDE.md](./CLAUDE.md) for full coding standards. Highlights:
+See [CLAUDE.md](./CLAUDE.md) for full coding standards and the verified engine API. Highlights:
 
-1. **No game logic in server** — call `shengji_engine.Game.step(action)` and trust it
+1. **No game logic in server** — call `game.step(state, action)` on the `shengji` engine
 2. **Hand secrecy mandatory** — serialize state with opponent hands hidden
 3. **Identical protocol for humans and AI** — server treats all clients the same
-4. **Validate through the engine** — illegal move → engine raises, server catches and reports
-5. **Async/await discipline** — all I/O is async; no blocking operations
+4. **Validate legality before stepping** — confirm `action in legal_actions`, reply `"Illegal move"` otherwise
+5. **Async/await discipline** — all I/O is async; broadcasts use `asyncio.gather()`
 
 ## Development
 
 ### Setup
 
 ```bash
-pip install -r requirements.txt
+# Install the engine (sibling repo) editable, then the server deps:
+pip install -e ../shengji-engine
+pip install -r requirements.txt   # requirements.txt also references the engine via -e
 ```
 
 ### Run
@@ -129,25 +144,43 @@ Server runs on `http://localhost:8000`. WebSocket at `ws://localhost:8000/ws/{ro
 ### Test
 
 ```bash
-pytest
+python -m pytest -q     # 62 tests (run against the real engine, ~5s)
 ```
 
 ## Project Structure
 
 ```
 .
-├── main.py           # FastAPI app, WebSocket & REST endpoints
-├── room.py           # Room lifecycle, connection management
-├── protocol.py       # Message type definitions
-├── serializer.py     # State filtering (privacy)
-├── CLAUDE.md         # Coding standards & patterns
-├── README.md         # This file
-├── requirements.txt  # Dependencies
-└── tests/
-    ├── test_server.py       # WebSocket integration tests
-    ├── test_room.py         # Room management tests
-    └── test_serializer.py   # Privacy tests
+├── main.py             # FastAPI app, WebSocket & REST endpoints
+├── room.py             # Room: owns Game/GameState, connections, broadcasting
+├── protocol.py         # Card/Action <-> JSON translation
+├── serializer.py       # Per-player privacy-filtered state
+├── game_loop.py        # Action validation, engine step, broadcast
+├── conftest.py         # Shared pytest fixtures (real engine)
+├── test_protocol.py    # Translation round-trips
+├── test_serializer.py  # Privacy filtering
+├── test_room.py        # Connection lifecycle + broadcasting
+├── test_game_loop.py   # Turn enforcement, legality, full game to SCORING
+├── test_integration.py # End-to-end over FastAPI TestClient
+├── CLAUDE.md           # Coding standards, verified engine API, build status
+├── README.md           # This file
+└── requirements.txt    # Dependencies
 ```
+
+## Status
+
+All six build steps are complete and the suite passes (62 tests) against the **real**
+`shengji` engine — including a full game played to the `SCORING` phase through the
+WebSocket action loop.
+
+> **Note:** an earlier draft of this server was written against a fictional
+> `shengji_engine` API using mocks. It has been fully reconstructed against the real
+> `shengji` package (correct package name, `Action`/`ActionType`/`GameState` shapes,
+> single-char card encodings, and the KITTY legal-action explosion).
+
+**Remaining work:** stale-room sweeper (hook up `Room.is_stale`), reconnect/resume,
+auto-start + observer joins, and starting the next hand after `game_over`
+(`game.next_game(state)`). See CLAUDE.md → Remaining Work.
 
 ## Related
 

@@ -1,207 +1,112 @@
-"""Tests for protocol message definitions."""
+"""Tests for protocol.py — card/action translation against the real engine."""
 
 import pytest
-from pydantic import ValidationError
 
-from protocol import (
-    CardMessage,
-    ActionMessage,
-    JoinMessage,
-    PlayCardsMessage,
-    DeclareTrumpMessage,
-    CallHelperMessage,
-    PassMessage,
-    TakeKittyMessage,
-    StateUpdateMessage,
-    ErrorMessage,
-    GameOverMessage,
-    parse_client_message,
-)
+from shengji import Action, ActionType, Suit, Rank, TrumpBid
+from shengji.card import Card
+
+import protocol
 
 
-class TestCardMessage:
-    def test_valid_card(self):
-        card = CardMessage(suit="♥", rank="7", deck_id=0)
-        assert card.suit == "♥"
-        assert card.rank == "7"
-        assert card.deck_id == 0
+class TestCardRoundTrip:
+    def test_card_to_dict(self):
+        card = Card(Suit.HEARTS, Rank.SEVEN, 1)
+        assert protocol.card_to_dict(card) == {"suit": "H", "rank": "7", "deck_id": 1}
 
-    def test_card_missing_field(self):
-        with pytest.raises(ValidationError):
-            CardMessage(suit="♥", rank="7")  # Missing deck_id
+    def test_card_from_dict(self):
+        card = protocol.card_from_dict({"suit": "S", "rank": "A", "deck_id": 2})
+        assert card == Card(Suit.SPADES, Rank.ACE, 2)
+        assert card.deck_id == 2
 
-    def test_card_invalid_type(self):
-        with pytest.raises(ValidationError):
-            CardMessage(suit="♥", rank="7", deck_id="invalid")
+    def test_ten_uses_T(self):
+        # Rank.TEN serializes as "T".
+        d = protocol.card_to_dict(Card(Suit.CLUBS, Rank.TEN, 0))
+        assert d["rank"] == "T"
+        assert protocol.card_from_dict(d).rank == Rank.TEN
+
+    def test_jokers(self):
+        big = Card(Suit.JOKER, Rank.LARGE_JOKER, 0)
+        assert protocol.card_from_dict(protocol.card_to_dict(big)) == big
+
+    def test_deck_id_defaults_to_zero(self):
+        assert protocol.card_from_dict({"suit": "H", "rank": "K"}).deck_id == 0
+
+    def test_invalid_card_raises(self):
+        with pytest.raises(ValueError):
+            protocol.card_from_dict({"suit": "X", "rank": "7"})
+
+    def test_cards_from_list_requires_list(self):
+        with pytest.raises(ValueError):
+            protocol.cards_from_list({"not": "a list"})
 
 
-class TestActionMessage:
-    def test_valid_action(self):
-        action = ActionMessage(
-            action_type="PLAY_CARDS",
-            cards=[CardMessage(suit="♥", rank="7", deck_id=0)],
+class TestActionToDict:
+    def test_play_cards_action(self):
+        action = Action(
+            action_type=ActionType.PLAY_CARDS,
+            cards=(Card(Suit.HEARTS, Rank.SEVEN, 0),),
         )
-        assert action.action_type == "PLAY_CARDS"
-        assert len(action.cards) == 1
-        assert action.target is None
+        d = protocol.action_to_dict(action, index=3)
+        assert d["index"] == 3
+        assert d["action_type"] == "PLAY_CARDS"
+        assert d["cards"] == [{"suit": "H", "rank": "7", "deck_id": 0}]
+        assert d["trump_bid"] is None
 
-    def test_action_with_target(self):
-        action = ActionMessage(
-            action_type="CALL_HELPER",
-            cards=[CardMessage(suit="♦", rank="K", deck_id=1)],
-            target=2,
+    def test_bid_action_serializes_trump_bid(self):
+        action = Action(
+            action_type=ActionType.BID_TRUMP,
+            trump_bid=TrumpBid(count=2, suit=Suit.HEARTS, bidder_id=4),
         )
-        assert action.target == 2
+        d = protocol.action_to_dict(action, index=0)
+        assert d["trump_bid"] == {"count": 2, "suit": "H", "bidder_id": 4}
 
-    def test_action_empty_cards(self):
-        action = ActionMessage(action_type="PASS")
-        assert action.cards == []
-
-
-class TestClientMessages:
-    def test_join_message(self):
-        msg = JoinMessage(type="join", player_id=3)
-        assert msg.type == "join"
-        assert msg.player_id == 3
-
-    def test_play_cards_message(self):
-        msg = PlayCardsMessage(
-            type="play_cards",
-            cards=[
-                CardMessage(suit="♥", rank="7", deck_id=0),
-                CardMessage(suit="♥", rank="8", deck_id=0),
-            ],
+    def test_call_helper_action(self):
+        action = Action(
+            action_type=ActionType.CALL_HELPER,
+            cards=(Card(Suit.DIAMONDS, Rank.KING, 0),),
         )
-        assert msg.type == "play_cards"
-        assert len(msg.cards) == 2
+        d = protocol.action_to_dict(action, index=1)
+        assert d["action_type"] == "CALL_HELPER"
+        assert d["cards"][0]["rank"] == "K"
 
-    def test_declare_trump_message(self):
-        msg = DeclareTrumpMessage(
-            type="declare_trump",
-            level_cards=[CardMessage(suit="♥", rank="7", deck_id=0)],
+
+class TestMessageToAction:
+    def test_pass_trump(self):
+        a = protocol.message_to_action({"type": "pass_trump"}, player_id=0)
+        assert a == Action(action_type=ActionType.PASS_TRUMP)
+
+    def test_bid_trump_fills_bidder_id(self):
+        a = protocol.message_to_action(
+            {"type": "bid_trump", "count": 1, "suit": "H"}, player_id=2
         )
-        assert msg.type == "declare_trump"
-        assert len(msg.level_cards) == 1
+        assert a.action_type == ActionType.BID_TRUMP
+        assert a.trump_bid == TrumpBid(count=1, suit=Suit.HEARTS, bidder_id=2)
 
-    def test_call_helper_message(self):
-        msg = CallHelperMessage(
-            type="call_helper",
-            card=CardMessage(suit="♦", rank="K", deck_id=0),
+    def test_bid_trump_missing_fields(self):
+        with pytest.raises(ValueError):
+            protocol.message_to_action({"type": "bid_trump", "count": 1}, player_id=0)
+
+    def test_play_cards(self):
+        a = protocol.message_to_action(
+            {"type": "play_cards", "cards": [{"suit": "H", "rank": "7", "deck_id": 0}]},
+            player_id=0,
         )
-        assert msg.type == "call_helper"
-        assert msg.card.rank == "K"
+        assert a.action_type == ActionType.PLAY_CARDS
+        assert a.cards == (Card(Suit.HEARTS, Rank.SEVEN, 0),)
 
-    def test_pass_message(self):
-        msg = PassMessage(type="pass")
-        assert msg.type == "pass"
-
-    def test_take_kitty_message(self):
-        msg = TakeKittyMessage(
-            type="take_kitty",
-            buried_cards=[CardMessage(suit="♣", rank="2", deck_id=0)],
+    def test_call_helper(self):
+        a = protocol.message_to_action(
+            {"type": "call_helper", "suit": "D", "rank": "K"}, player_id=0
         )
-        assert msg.type == "take_kitty"
-        assert len(msg.buried_cards) == 1
+        assert a.action_type == ActionType.CALL_HELPER
+        assert a.cards[0] == Card(Suit.DIAMONDS, Rank.KING, 0)
 
+    def test_take_kitty(self):
+        cards = [{"suit": "H", "rank": str(r), "deck_id": 0} for r in (2, 3, 4, 5, 6, 7)]
+        a = protocol.message_to_action({"type": "take_kitty", "cards": cards}, player_id=0)
+        assert a.action_type == ActionType.TAKE_KITTY
+        assert len(a.cards) == 6
 
-class TestServerMessages:
-    def test_state_update_message(self):
-        msg = StateUpdateMessage(
-            type="state_update",
-            phase="TRICK_PLAYING",
-            current_player=2,
-            dealer_id=0,
-            your_hand=[CardMessage(suit="♥", rank="7", deck_id=0)],
-            hands_size=[5, 6, 4, 7, 5, 6],
-            legal_actions=[
-                ActionMessage(
-                    action_type="PLAY_CARDS",
-                    cards=[CardMessage(suit="♥", rank="7", deck_id=0)],
-                )
-            ],
-            trump_suit="♥",
-            trump_level="7",
-            current_trick=[(0, [CardMessage(suit="♠", rank="A", deck_id=0)])],
-            tricks_won=[[], [], [], [], [], []],
-            scores=[0, 0, 0, 0, 0, 0],
-            revealed_helpers=[],
-        )
-        assert msg.type == "state_update"
-        assert msg.phase == "TRICK_PLAYING"
-        assert msg.current_player == 2
-
-    def test_error_message(self):
-        msg = ErrorMessage(type="error", message="Not your turn")
-        assert msg.type == "error"
-        assert msg.message == "Not your turn"
-
-    def test_game_over_message(self):
-        msg = GameOverMessage(
-            type="game_over",
-            winner_side="farmer",
-            scores={"farmer": 180, "dealer": 20},
-            level_changes={0: 2, 1: 0, 2: 2, 3: -1, 4: 2, 5: -1},
-        )
-        assert msg.type == "game_over"
-        assert msg.winner_side == "farmer"
-
-
-class TestParseClientMessage:
-    def test_parse_join_message(self):
-        data = {"type": "join", "player_id": 0}
-        msg = parse_client_message(data)
-        assert isinstance(msg, JoinMessage)
-        assert msg.player_id == 0
-
-    def test_parse_play_cards_message(self):
-        data = {
-            "type": "play_cards",
-            "cards": [{"suit": "♥", "rank": "7", "deck_id": 0}],
-        }
-        msg = parse_client_message(data)
-        assert isinstance(msg, PlayCardsMessage)
-        assert len(msg.cards) == 1
-
-    def test_parse_declare_trump_message(self):
-        data = {
-            "type": "declare_trump",
-            "level_cards": [{"suit": "♥", "rank": "7", "deck_id": 0}],
-        }
-        msg = parse_client_message(data)
-        assert isinstance(msg, DeclareTrumpMessage)
-
-    def test_parse_call_helper_message(self):
-        data = {
-            "type": "call_helper",
-            "card": {"suit": "♦", "rank": "K", "deck_id": 0},
-        }
-        msg = parse_client_message(data)
-        assert isinstance(msg, CallHelperMessage)
-
-    def test_parse_pass_message(self):
-        data = {"type": "pass"}
-        msg = parse_client_message(data)
-        assert isinstance(msg, PassMessage)
-
-    def test_parse_take_kitty_message(self):
-        data = {
-            "type": "take_kitty",
-            "buried_cards": [{"suit": "♣", "rank": "2", "deck_id": 0}],
-        }
-        msg = parse_client_message(data)
-        assert isinstance(msg, TakeKittyMessage)
-
-    def test_parse_unknown_message_type(self):
-        data = {"type": "unknown"}
-        with pytest.raises(ValueError, match="Unknown message type"):
-            parse_client_message(data)
-
-    def test_parse_invalid_message_missing_field(self):
-        data = {"type": "join"}  # Missing player_id
-        with pytest.raises(ValidationError):
-            parse_client_message(data)
-
-    def test_parse_message_no_type(self):
-        data = {"player_id": 0}
-        with pytest.raises(ValueError, match="Unknown message type"):
-            parse_client_message(data)
+    def test_unknown_type(self):
+        with pytest.raises(ValueError):
+            protocol.message_to_action({"type": "nonsense"}, player_id=0)

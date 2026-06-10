@@ -6,11 +6,11 @@ A thin FastAPI WebSocket server for six-player 拖拉机 (Sheng Ji). The server 
 
 ## Cardinal Rules
 
-1. **No game logic in this server.** Delegate all rule enforcement, card validity, trick resolution, scoring to `shengji-engine`. The server calls `game.step(action)` and trusts it to raise on violations.
+1. **No game logic in this server.** Delegate all rule enforcement, card validity, trick resolution, scoring to the `shengji` engine. The server calls `game.step(state, action)` and never re-derives rules.
 2. **Hand secrecy is non-negotiable.** `serializer.py` must filter opponent hands before any broadcast. Never send full game state to all clients.
 3. **Identical WebSocket protocol for humans and AI.** Server treats them the same: JSON messages over `/ws/{room_id}/{player_id}`, no special paths for bots.
-4. **Treat disconnects gracefully.** Pause game if player disconnects; resume when they reconnect within timeout. Remove stale rooms.
-5. **Validate through the engine, not the server.** Illegal move → call `game.step(action)` and let it raise `ValueError`; catch and broadcast error to the client.
+4. **Treat disconnects gracefully.** A disconnect frees the seat and notifies the room (reconnect/resume is listed under Remaining Work).
+5. **Validate legality before stepping.** The real engine is forgiving — bad input often returns the state unchanged rather than raising — so the server confirms `action in state.legal_actions` (or, for KITTY, a valid 6-card bury) and replies `"Illegal move"` itself.
 
 ## Coding Standards
 
@@ -95,109 +95,144 @@ Not sequential awaits—they serialize and delay updates.
 - **Unknown message type**: log and ignore silently
 - **Malformed JSON**: catch `json.JSONDecodeError`, send error response
 
-## Key Data Structures
+## Engine Integration (VERIFIED against the real `shengji` package)
 
-### Room
+> The engine lives in the sibling repo and is imported as the package **`shengji`**
+> (NOT `shengji_engine`). Install editable: `pip install -e ../shengji-engine`.
+> Everything below was read off the real source — trust it over older drafts.
+
+### Imports
 ```python
-class Room:
-    room_id: str
-    game: Game  # The engine instance
-    connections: dict[int, WebSocket]  # player_id -> WebSocket
-    state: GameState  # Current game state
-    created_at: float
-    last_activity: float
+from shengji import Game, GameState, Action, ActionType, GamePhase, Suit, Rank, TrumpBid
+from shengji.card import Card
 ```
 
-### Protocol Messages (Client → Server)
+### Game API (pure / immutable)
 ```python
-# Join
-{"type": "join", "player_id": int}
+game = Game(num_players=6)
+state = game.reset(dealer_id=0)            # -> GameState in DEALING
+state, info = game.step(state, action)     # action may be None to auto-deal in DEALING
+# info: {"phase", "current_player"}; at SCORING also {"farmer_score","next_dealer","game_over"}
+```
+`state.legal_actions` is precomputed for `state.current_player` in EVERY phase.
 
-# Play cards
-{"type": "play_cards", "cards": [{"suit": "♥", "rank": "7", "deck_id": 0}, ...]}
+### Enums / values (wire encodings)
+- `Suit`: HEARTS=`"H"`, DIAMONDS=`"D"`, CLUBS=`"C"`, SPADES=`"S"`, JOKER=`"J"`.
+- `Rank`: `"2".."9"`, TEN=`"T"`, JACK=`"J"`, QUEEN=`"Q"`, KING=`"K"`, ACE=`"A"`,
+  SMALL_JOKER=`"Js"`, LARGE_JOKER=`"Jl"`.
+- `GamePhase`: DEALING → TRUMP_DECLARATION → KITTY → CALL_HELPER → TRICK_PLAYING → SCORING.
+  Compare with `==`; serialize with `.name`.
+- `ActionType`: `BID_TRUMP`, `PASS_TRUMP`, `PLAY_CARDS`, `TAKE_KITTY`, `CALL_HELPER`.
+  (There is **no** `DECLARE_TRUMP` and **no** generic `PASS`.)
 
-# Declare trump
-{"type": "declare_trump", "level_cards": [{"suit": "♥", "rank": "7"}, ...]}
+### `Card`
+`Card(suit: Suit, rank: Rank, deck_id: int)`. Equality/hash ignore `deck_id`
+(so a "pair" is two cards equal by suit+rank). `str(card) == suit.value + rank.value`.
 
-# Call helper
-{"type": "call_helper", "card": {"suit": "♦", "rank": "K"}}
+### `Action`
+```python
+Action(action_type, cards=(), trump_bid=None, target_suit=None, target_card=None)
+```
+- `BID_TRUMP` → set `trump_bid = TrumpBid(count, suit, bidder_id)`.
+- `TAKE_KITTY` / `PLAY_CARDS` → set `cards`.
+- `CALL_HELPER` → `cards=(Card(suit, rank, 0),)`.
+Dataclass `__eq__` compares all fields; safe to test `action in state.legal_actions`.
+
+### `GameState` fields that matter for serialization
+`phase, current_player, dealer_id, hands (tuple per player), kitty, cards_dealt,
+trump_suit, trump_level (str), trump_locked, current_trump_bid, current_trick
+([(player_id, cards), ...]), tricks_won ([(winner_id, cards), ...] — PER TRICK, not
+per player), scores, player_levels, called_rank, called_suit, helper_players,
+buried_cards`.
+There is **no** `helper_card`, no `revealed_helpers`, no per-player `tricks_won`.
+
+### The KITTY gotcha
+`KITTY` legal actions = C(32,6) ≈ **906,192** bury options. NEVER serialize them.
+`serializer.py` omits `legal_actions` when the count exceeds `MAX_LEGAL_ACTIONS`
+(sets `legal_actions_truncated: true`); the client drives KITTY with a semantic
+`take_kitty` message instead.
+
+## Protocol (as implemented)
+
+### Client → Server
+```jsonc
+{"type": "action", "index": 0}                 // pick a precomputed legal action by index
+{"type": "pass_trump"}
+{"type": "bid_trump", "count": 1, "suit": "H"}
+{"type": "take_kitty", "cards": [<6 card dicts>]}
+{"type": "call_helper", "suit": "D", "rank": "K"}
+{"type": "play_cards", "cards": [<card dicts>]}
+```
+Card dict: `{"suit": "H", "rank": "7", "deck_id": 0}`. `player_id` comes from the URL
+path, not the message body. Unknown / non-action message types are ignored silently.
+
+### Server → Client
+```jsonc
+{"type": "joined", "player_id", "room_id", "connected_players"}
+{"type": "state_update", ...serialized per-player view...}
+{"type": "player_connected" | "player_disconnected", "player_id", "connected_count"}
+{"type": "error", "message": "Not your turn" | "Illegal move" | ...}
+{"type": "game_over", "farmer_score", "next_dealer", "player_levels"}
 ```
 
-### Protocol Messages (Server → Client)
-```python
-# Game state update
-{
-    "type": "state_update",
-    "phase": "TRICK_PLAYING",
-    "current_player": 2,
-    "your_hand": [...],
-    "hands_size": [5, 6, 4, 7, 5, 6],
-    "legal_actions": [...],
-    "current_trick": [...],
-    "scores": [20, 0, 15, 0, 0, 10],
-    ...
-}
+### Action handling pipeline (`game_loop.handle_action`)
+1. Reject if `player_id != state.current_player` → `"Not your turn"`.
+2. Resolve the action: index path picks `legal_actions[i]`; semantic path rebuilds an
+   `Action` and validates legality (`action in legal_actions`, except KITTY which is
+   validated as a 6-card subset of the dealer's hand) → `"Illegal move"` on failure.
+3. `room.state, info = game.step(room.state, action)`.
+4. `await room.broadcast_state()` (each player gets their filtered view).
+5. If `phase == SCORING`, broadcast `game_over`.
 
-# Error
-{"type": "error", "message": "Not your turn"}
+## Module Map (current)
 
-# Game over
-{"type": "game_over", "winner_side": "farmer", "scores": {...}}
-```
+| File | Responsibility |
+|------|----------------|
+| `main.py` | FastAPI app, REST (`/health`, `/rooms`, `/rooms/{id}`), WS endpoint + receive loop |
+| `room.py` | `Room`: owns `Game`+`GameState`, connections, `broadcast`/`broadcast_state` |
+| `protocol.py` | Card/Action ⇄ JSON translation; `message_to_action`; no game logic |
+| `serializer.py` | Per-player privacy-filtered `state_update` payload |
+| `game_loop.py` | `handle_action`, `handle_join`, legality validation |
+| `conftest.py` | Test fixtures: real `Game`, `advance_to_phase` helper |
 
 ## Operational Details
 
-- **In-memory room storage**: Acceptable for local play; stale rooms expire after 1 hour of inactivity
-- **Dealer ID tracking**: Persists across rounds; remember to cycle to next dealer
-- **Observer support**: Allow players to join as read-only if game already started (< 6 connected)
-- **Async/await**: All I/O is async; use `await` for WebSocket sends, `asyncio.gather()` for broadcasts
-- **No blocking operations**: Never call synchronous file I/O, database I/O, or `time.sleep()` in async context
+- **In-memory room storage**: acceptable for local play. `Room.is_stale()` flags rooms
+  idle > 1h (a sweeper is not yet wired up — see Remaining Work).
+- **Async/await**: all WS sends are async; broadcasts use `asyncio.gather()`.
+- **One Game per Room**: never global; `room.state` is reassigned from the engine's
+  return value, never mutated in place.
 
 ## Testing Strategy
 
-### Unit Tests
-```python
-# test_serializer.py
-def test_hand_hidden_from_opponent(): ...
-def test_legal_actions_only_for_current_player(): ...
+Tests run against the **real engine** (no mocking of game logic). Engine objects are
+created via the `conftest.py` fixtures; only WebSockets are mocked (`AsyncMock`) or
+driven through FastAPI's `TestClient`.
+- `test_protocol.py` — card/action round-trips and reconstruction.
+- `test_serializer.py` — privacy: own-hand-only, current-player-only actions, KITTY
+  truncation, dealer-only kitty.
+- `test_room.py` — connection lifecycle + broadcasting.
+- `test_game_loop.py` — turn enforcement, legality, and a **full game** played to
+  SCORING through `handle_action`.
+- `test_integration.py` — end-to-end over `TestClient`: handshake, messaging, errors.
 
-# test_room.py
-def test_room_creation(): ...
-def test_player_join(): ...
-def test_disconnect_handling(): ...
-```
+Run: `python -m pytest -q` (62 tests, ~5s).
 
-### Integration Tests
-```python
-# test_server.py — WebSocket client simulation
-async def test_full_game_via_websocket():
-    async with websockets.connect("ws://localhost:8000/ws/room1/0") as ws:
-        # Join
-        await ws.send(json.dumps({"type": "join", "player_id": 0}))
-        state = json.loads(await ws.recv())
-        assert state["phase"] == "TRUMP_DECLARATION"
-        
-        # Play action
-        await ws.send(json.dumps({"type": "play_cards", "cards": [...]}))
-        state = json.loads(await ws.recv())
-        assert state["phase"] == "TRICK_PLAYING"
-```
+## Build Status
 
-## Important Patterns (Not Mistakes, But Easy to Confuse)
+- [x] **Step 1** `protocol.py` — engine-accurate translation
+- [x] **Step 2** `main.py` — REST + WS wired to real `Room`
+- [x] **Step 3** `room.py` — owns real `Game`/`GameState`
+- [x] **Step 4** `serializer.py` — privacy + KITTY truncation
+- [x] **Step 5** `game_loop.py` — validate-through-engine + broadcast + game_over
+- [x] **Step 6** integration tests — full WebSocket flow, full game to SCORING
+- [x] **Reconstruction** — replaced the original mock/`shengji_engine` code (written
+  against a fictional API) with code verified against the real `shengji` package.
 
-- **Async/await discipline**: All network I/O is async. Never mix `asyncio` with blocking calls. Use `asyncio.create_task()` for background room cleanup.
-- **Room lifecycle**: Create on `POST /rooms`, destroy after 1-hour inactivity or manual close. Don't leave rooms in memory forever.
-- **Action parsing**: Convert JSON action message → `shengji_engine.Action` dataclass before passing to `game.step()`. The engine only speaks its own types.
-- **State ownership**: Each room owns its `GameState` instance. Never share state between rooms. Never mutate state in place—always use engine's return value.
-- **Broadcast symmetry**: When you broadcast state, every client sees the same structure (just with their own hand/actions filled in). Consistency prevents client-side bugs.
-
-## Build Order
-
-1. `protocol.py` (message types) + basic tests
-2. `main.py` (FastAPI + endpoints) with health check
-3. `room.py` (Room class, connection management)
-4. `serializer.py` (state filtering + privacy)
-5. `game loop` (accept actions, call engine, broadcast state)
-6. Integration tests (full WebSocket flow)
-
-Do not proceed to step N+1 until tests for step N all pass.
+### Remaining Work (not yet implemented)
+- Stale-room sweeper (`Room.is_stale` exists; nothing calls it). Add an
+  `asyncio` background task or sweep on room creation.
+- Reconnect/resume after disconnect (currently a disconnect just frees the seat).
+- Auto-start semantics at 6 players / observer (read-only) joins after start.
+- `game_over` does not yet start the next hand (`game.next_game(state)` exists in the
+  engine if/when we want continuous play).
