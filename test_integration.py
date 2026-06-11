@@ -67,13 +67,17 @@ class TestWebSocketHandshake:
             with client.websocket_connect("/ws/ghost/0"):
                 pass
 
-    def test_duplicate_player_rejected(self, client):
+    def test_duplicate_player_takes_over_seat(self, client):
+        # Last-write-wins: a second connection to an occupied seat evicts the
+        # first socket and takes over, instead of being rejected.
         rid = client.post("/rooms").json()["room_id"]
         with client.websocket_connect(f"/ws/{rid}/0") as ws0:
-            ws0.receive_json()
-            with pytest.raises(Exception):
-                with client.websocket_connect(f"/ws/{rid}/0"):
-                    pass
+            assert ws0.receive_json()["type"] == "joined"
+            with client.websocket_connect(f"/ws/{rid}/0") as ws1:
+                msg = ws1.receive_json()
+                assert msg["type"] == "joined"
+                assert msg["player_id"] == 0
+                assert msg["connected_players"] == 1
 
 
 class TestMessaging:

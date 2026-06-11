@@ -115,9 +115,15 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, player_id: int)
     # Check if this is a reconnect or a fresh join.
     is_reconnect = room.is_reconnecting(player_id)
     if room.has_player(player_id):
-        # Seat is occupied by an active connection; reject.
-        await websocket.close(code=4002, reason="Player already connected")
-        return
+        # Seat is occupied: last-write-wins. Evict the old socket (likely a stale
+        # tab or zombie connection) so the new one can take over immediately.
+        old_ws = room.evict_connection(player_id)
+        if old_ws is not None:
+            try:
+                await old_ws.close(code=4001, reason="Seat taken over")
+            except Exception:
+                pass
+        is_reconnect = False
 
     await websocket.accept()
 
@@ -162,12 +168,14 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, player_id: int)
             # Unknown / non-action message types are ignored silently (CLAUDE.md).
 
     except WebSocketDisconnect:
-        room.remove_connection(player_id)
-        await room.broadcast({
-            "type": "player_disconnected",
-            "player_id": player_id,
-            "connected_count": room.connected_count(),
-        })
+        # Only treat this as a real disconnect if our socket is still the seat's
+        # active one — an evicted socket must not clobber its replacement.
+        if room.remove_connection(player_id, websocket):
+            await room.broadcast({
+                "type": "player_disconnected",
+                "player_id": player_id,
+                "connected_count": room.connected_count(),
+            })
 
 
 if __name__ == "__main__":

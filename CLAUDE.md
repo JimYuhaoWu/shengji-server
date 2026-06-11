@@ -240,3 +240,31 @@ Run: `python -m pytest -q` (62 tests, ~5s).
 - **Future work:**
   - Auto-start game when 6 players connected (game naturally progresses in DEALING)
   - Observer/spectator mode (read-only join after game starts)
+
+## Session Log — 2026-06-11 (live-playtest bug fixes)
+
+1. **Seat takeover (last-write-wins) replaces the duplicate-connection reject.**
+   A new connection to an occupied seat used to be refused with code `4002`
+   ("Player already connected"). Combined with client-side duplicate sockets
+   (StrictMode, a stale `onclose`, a parallel reconnect loop), this produced a
+   reject→close→retry storm and the user could never hold a seat. Now the
+   WebSocket endpoint (`main.py`) **evicts** the old socket via
+   `room.evict_connection(player_id)`, closes it with code `4001`
+   ("Seat taken over"), and accepts the newcomer. `room.remove_connection` is
+   now **socket-aware** (`remove_connection(player_id, websocket)`): the
+   `WebSocketDisconnect` handler only frees the seat / broadcasts
+   `player_disconnected` when the disconnecting socket is still the seat's active
+   one, so an evicted/stale socket can't clobber its replacement. Test:
+   `test_integration.py::...::test_duplicate_player_takes_over_seat` (67 passing).
+
+### Known issues / planned work (NOT yet done)
+
+- **`legal_actions_truncated` is overloaded as a "this is KITTY" signal.**
+  `serializer.py` sets it whenever `len(legal_actions) > MAX_LEGAL_ACTIONS` (500)
+  in *any* phase, and the AI client treats truncation as "go bury the kitty."
+  Today only KITTY (~906k actions) exceeds the cap, but the coupling is fragile:
+  any future non-KITTY phase that truncates would be mis-read as a bury and
+  deadlock the client (it already bit the AI once — see shengji-ai session log).
+  Plan: make the bury signal phase-explicit (key on `phase == KITTY`), and stop
+  generating/serializing KITTY's enumerated actions altogether (validate the
+  bury directly, which `_bury_is_valid` already does).

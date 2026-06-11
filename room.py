@@ -43,11 +43,31 @@ class Room:
         self.connections[player_id] = websocket
         self.last_activity = datetime.now()
 
-    def remove_connection(self, player_id: int) -> None:
-        """Mark a player as temporarily disconnected (keep the seat for grace period)."""
+    def remove_connection(self, player_id: int, websocket: WebSocket | None = None) -> bool:
+        """Mark a player as temporarily disconnected (keep the seat for grace period).
+
+        If ``websocket`` is given, only remove when it is still the active socket for
+        this seat. This prevents an evicted/stale socket's disconnect handler from
+        clobbering a newer connection that has already taken over the seat.
+
+        Returns True if a connection was actually removed.
+        """
+        if websocket is not None and self.connections.get(player_id) is not websocket:
+            return False
+        if player_id not in self.connections:
+            return False
         self.connections.pop(player_id, None)
         self.disconnected_at[player_id] = datetime.now()
         self.last_activity = datetime.now()
+        return True
+
+    def evict_connection(self, player_id: int) -> WebSocket | None:
+        """Drop the seat's current socket entirely (no grace) so a newer one can take
+        over immediately. Returns the evicted socket, if any, for the caller to close."""
+        old_ws = self.connections.pop(player_id, None)
+        self.disconnected_at.pop(player_id, None)
+        self.last_activity = datetime.now()
+        return old_ws
 
     def is_reconnecting(self, player_id: int) -> bool:
         """True if the player disconnected recently and is reconnecting within grace period."""
